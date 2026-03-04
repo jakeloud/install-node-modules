@@ -1,4 +1,6 @@
 # install-node-modules
 
 
-[click](https://github.com/conaticus/click) did not work (did not work inside docker + package.json parsing not yet implemented)
+[click](https://github.com/conaticus/click) did not work
+
+[vold](https://github.com/suptejas/volt) support ended, did not work
