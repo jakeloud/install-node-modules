@@ -1,5 +1,7 @@
 # install-node-modules
 
+![bench chart](./chart.png)
+
 ## Bench
 
 first run `./build.sh <name>`
