@@ -5,4 +5,4 @@ ENV PATH="$PNPM_HOME:$PATH"
 RUN corepack enable
 
 COPY package.json .
-RUN pnpm i
+CMD ["pnpm", "i"]
