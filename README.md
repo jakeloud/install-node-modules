@@ -2,11 +2,16 @@
 
 ## Bench
 
-1. NPM - 482m RAM
-2. PNPM - m RAM
-3. yarn - m RAM
-4. bun - m RAM
-5. flash install - m RAM
+first run `./build.sh <name>`
+then run `./run.sh <number of megs>`
+
+Minimal requirements:
+
+1. bun - 298m RAM
+2. yarn - 325m RAM
+3. pnpm - 449m RAM
+4. npm - 482m RAM
+5. flashinstall - 504m RAM
 
 ## Other installers
 
