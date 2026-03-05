@@ -1,3 +1,3 @@
 FROM node:slim
 COPY package.json .
-CMD ["npm", "i", "--verbose"]
+CMD ["npm", "i"]
