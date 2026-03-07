@@ -42,6 +42,7 @@ class Installer:
             print("No dependencies found")
             return
 
+        print(f"Found {len(deps)} top-level dependencies")
         self.resolve_and_install(deps)
         self.run_postinstall()
         print("Installation complete!")
@@ -50,7 +51,11 @@ class Installer:
         try:
             with open(self.package_json_path) as f:
                 data = json.load(f)
-            return data.get("dependencies", {})
+            deps = data.get("dependencies", {})
+            dev_deps = data.get("devDependencies", {})
+            # Merge dependencies and devDependencies
+            all_deps = {**dev_deps, **deps}
+            return all_deps
         except (FileNotFoundError, json.JSONDecodeError) as e:
             print(f"Error reading package.json: {e}")
             return {}
@@ -89,16 +94,21 @@ class Installer:
                         pkg = future.result()
                         if pkg:
                             self.install_package(pkg)
-                            self.resolved.add(pkg.name)
                             for dep_name, dep_ver in pkg.dependencies.items():
-                                if dep_name not in enqueued:
+                                if (
+                                    dep_name not in enqueued
+                                    and dep_name not in self.resolved
+                                ):
                                     enqueued.add(dep_name)
                                     queue.append((dep_name, dep_ver))
+                        else:
+                            print(f"Failed to resolve {name}@{version_spec}")
                     except Exception as e:
                         print(f"Failed to process {name}: {e}")
-                        self.resolved.add(name)
 
-    def resolve_package(self, name: str, version_spec: str) -> Optional[Package]:
+    def resolve_package(
+        self, name: str, version_spec: str, retries=3
+    ) -> Optional[Package]:
         if name in self.resolving:
             return None
 
@@ -106,15 +116,23 @@ class Installer:
 
         try:
             url = f"{NPM_REGISTRY}/{name}"
-            result = subprocess.run(
-                ["curl", "-s", "-f", url],
-                capture_output=True,
-                text=True,
-                timeout=FETCH_TIMEOUT,
-            )
+            result = None
+            for i in range(retries):
+                result = subprocess.run(
+                    ["curl", "-s", "-f", "-L", url],
+                    capture_output=True,
+                    text=True,
+                    timeout=FETCH_TIMEOUT,
+                )
 
-            if result.returncode != 0:
-                print(f"Failed to fetch {name}")
+                if result.returncode == 0:
+                    break
+                if i == retries - 1:
+                    print(f"Failed to fetch {name} after {retries} attempts")
+                    return None
+                print(f"Retrying {name} ({i + 1}/{retries})...")
+
+            if result is None or result.returncode != 0:
                 return None
 
             metadata = json.loads(result.stdout)
@@ -181,7 +199,10 @@ class Installer:
 
     def match_caret(self, available_versions, base: str) -> Optional[str]:
         base_parts = base.split(".")
-        major = int(base_parts[0]) if base_parts else 0
+        try:
+            major = int(base_parts[0]) if base_parts else 0
+        except ValueError:
+            major = 0
 
         matching = []
         for v in available_versions:
@@ -201,7 +222,10 @@ class Installer:
     def match_tilde(self, available_versions, base: str) -> Optional[str]:
         base_parts = base.split(".")
         if len(base_parts) >= 2:
-            major, minor = int(base_parts[0]), int(base_parts[1])
+            try:
+                major, minor = int(base_parts[0]), int(base_parts[1])
+            except ValueError:
+                return None
             matching = []
             for v in available_versions:
                 try:
@@ -275,7 +299,8 @@ class Installer:
 
             if result.returncode != 0:
                 print(f"Failed to download {pkg.name}")
-                os.unlink(tmp_path)
+                if os.path.exists(tmp_path):
+                    os.unlink(tmp_path)
                 return
 
             pkg_dir = self.node_modules / pkg.name
@@ -286,9 +311,9 @@ class Installer:
                 check=True,
             )
 
-            os.unlink(tmp_path)
+            if os.path.exists(tmp_path):
+                os.unlink(tmp_path)
 
-            self.write_package_json(pkg)
             self.create_bin_links(pkg)
 
             pkg.installed = True
@@ -323,33 +348,31 @@ class Installer:
                 self.create_symlink(bin_dir, name, pkg_dir / bin_entry)
 
         except Exception as e:
-            pass
+            print(f"Error reading package.json for {pkg.name}: {e}")
 
     def create_symlink(self, bin_dir: Path, name: str, target: Path):
         link_path = bin_dir / name
         try:
-            if link_path.exists():
+            if link_path.exists() or link_path.is_symlink():
                 link_path.unlink()
-            link_path.symlink_to(target)
-        except Exception:
-            pass
 
-    def write_package_json(self, pkg: Package):
-        pkg_json = {
-            "name": pkg.name,
-            "version": pkg.version,
-            "dependencies": pkg.dependencies,
-        }
+            abs_target = target.resolve()
 
-        pkg_dir = self.node_modules / pkg.name
-        with open(pkg_dir / "package.json", "w") as f:
-            json.dump(pkg_json, f, indent=2)
+            if abs_target.is_file():
+                abs_target.chmod(0o755)
+                link_path.symlink_to(abs_target)
+                print(f"Linked {name} -> {abs_target}")
+            else:
+                # Some packages have bins that don't exist in all versions or platforms
+                pass
+        except Exception as e:
+            print(f"Failed to create symlink {name}: {e}")
 
     def run_postinstall(self):
         print("Running postinstall scripts...")
 
         for pkg_dir in self.node_modules.iterdir():
-            if not pkg_dir.is_dir():
+            if not pkg_dir.is_dir() or pkg_dir.name == ".bin":
                 continue
 
             pkg_json_path = pkg_dir / "package.json"
@@ -367,7 +390,7 @@ class Installer:
                     print(f"Running postinstall for {pkg_data['name']}")
                     env = os.environ.copy()
                     env["PATH"] = (
-                        f"/usr/local/bin:/usr/bin:/bin:{self.node_modules}/.bin"
+                        f"/usr/local/bin:/usr/bin:/bin:{self.node_modules.resolve()}/.bin"
                     )
 
                     subprocess.run(
