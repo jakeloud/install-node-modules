@@ -1,0 +1,394 @@
+#!/usr/bin/env python3
+import json
+import os
+import re
+import subprocess
+import sys
+import tempfile
+import hashlib
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from pathlib import Path
+from typing import Optional
+
+NPM_REGISTRY = "https://registry.npmjs.org"
+MAX_CONCURRENT = 64
+NODE_MODULES = Path("node_modules")
+FETCH_TIMEOUT = 120
+DOWNLOAD_TIMEOUT = 300
+
+
+class Package:
+    def __init__(self, name: str, version: str, tarball: str = ""):
+        self.name = name
+        self.version = version
+        self.tarball = tarball
+        self.dependencies = {}
+        self.installed = False
+
+
+class Installer:
+    def __init__(self, package_json_path: str):
+        self.package_json_path = Path(package_json_path)
+        self.packages: dict[str, Package] = {}
+        self.resolved: set[str] = set()
+        self.resolving: set[str] = set()
+        self.pending: list[tuple[str, str]] = []
+        self.node_modules = NODE_MODULES
+
+    def run(self):
+        print(f"Installing dependencies from {self.package_json_path}...")
+        deps = self.read_package_json()
+        if not deps:
+            print("No dependencies found")
+            return
+
+        self.resolve_and_install(deps)
+        self.run_postinstall()
+        print("Installation complete!")
+
+    def read_package_json(self) -> dict:
+        try:
+            with open(self.package_json_path) as f:
+                data = json.load(f)
+            return data.get("dependencies", {})
+        except (FileNotFoundError, json.JSONDecodeError) as e:
+            print(f"Error reading package.json: {e}")
+            return {}
+
+    def resolve_and_install(self, deps: dict):
+        from collections import deque
+
+        queue = deque(deps.items())
+        enqueued = set(deps.keys())
+
+        while queue:
+            batch = []
+            processed = 0
+
+            while queue and processed < MAX_CONCURRENT:
+                name, version_spec = queue.popleft()
+                if name not in self.resolved:
+                    batch.append((name, version_spec))
+                    processed += 1
+
+            if not batch:
+                break
+
+            with ThreadPoolExecutor(max_workers=MAX_CONCURRENT) as executor:
+                futures = {
+                    executor.submit(self.resolve_package, name, version_spec): (
+                        name,
+                        version_spec,
+                    )
+                    for name, version_spec in batch
+                }
+
+                for future in as_completed(futures):
+                    name, version_spec = futures[future]
+                    try:
+                        pkg = future.result()
+                        if pkg:
+                            self.install_package(pkg)
+                            self.resolved.add(pkg.name)
+                            for dep_name, dep_ver in pkg.dependencies.items():
+                                if dep_name not in enqueued:
+                                    enqueued.add(dep_name)
+                                    queue.append((dep_name, dep_ver))
+                    except Exception as e:
+                        print(f"Failed to process {name}: {e}")
+                        self.resolved.add(name)
+
+    def resolve_package(self, name: str, version_spec: str) -> Optional[Package]:
+        if name in self.resolving:
+            return None
+
+        self.resolving.add(name)
+
+        try:
+            url = f"{NPM_REGISTRY}/{name}"
+            result = subprocess.run(
+                ["curl", "-s", "-f", url],
+                capture_output=True,
+                text=True,
+                timeout=FETCH_TIMEOUT,
+            )
+
+            if result.returncode != 0:
+                print(f"Failed to fetch {name}")
+                return None
+
+            metadata = json.loads(result.stdout)
+            version = self.resolve_version(metadata, version_spec)
+
+            if not version:
+                print(f"No matching version for {name}@{version_spec}")
+                return None
+
+            tarball = (
+                metadata.get("versions", {})
+                .get(version, {})
+                .get("dist", {})
+                .get("tarball")
+            )
+            if not tarball:
+                print(f"No tarball for {name}@{version}")
+                return None
+
+            deps = metadata.get("versions", {}).get(version, {}).get("dependencies", {})
+
+            pkg = Package(name, version, tarball)
+            pkg.dependencies = deps
+            return pkg
+
+        except Exception as e:
+            print(f"Error resolving {name}: {e}")
+            return None
+        finally:
+            self.resolving.discard(name)
+
+    def resolve_version(self, metadata: dict, version_spec: str) -> Optional[str]:
+        versions = metadata.get("versions", {})
+        if not versions:
+            return None
+
+        if version_spec == "*" or version_spec == "latest":
+            return self.get_latest(versions.keys())
+        elif version_spec.startswith("^"):
+            base = version_spec[1:]
+            return self.match_caret(versions.keys(), base)
+        elif version_spec.startswith("~"):
+            base = version_spec[1:]
+            return self.match_tilde(versions.keys(), base)
+        elif version_spec.startswith(">="):
+            return self.match_range(versions.keys(), version_spec)
+        elif version_spec in versions:
+            return version_spec
+
+        return self.match_caret(versions.keys(), version_spec)
+
+    def get_latest(self, available_versions) -> Optional[str]:
+        valid = [v for v in available_versions if not self.is_prerelease(v)]
+        if valid:
+            return sorted(valid, key=lambda x: self.version_key(x))[-1]
+        if available_versions:
+            return sorted(available_versions, key=lambda x: self.version_key(x))[-1]
+        return None
+
+    def is_prerelease(self, version: str) -> bool:
+        return bool(
+            re.search(r"[a-zA-Z]", version.split(".")[0] if "." in version else version)
+        )
+
+    def match_caret(self, available_versions, base: str) -> Optional[str]:
+        base_parts = base.split(".")
+        major = int(base_parts[0]) if base_parts else 0
+
+        matching = []
+        for v in available_versions:
+            try:
+                v_parts = v.split(".")
+                if len(v_parts) >= 2:
+                    v_major = int(v_parts[0])
+                    if v_major == major:
+                        matching.append(v)
+            except ValueError:
+                continue
+
+        if matching:
+            return sorted(matching, key=lambda x: self.version_key(x))[-1]
+        return None
+
+    def match_tilde(self, available_versions, base: str) -> Optional[str]:
+        base_parts = base.split(".")
+        if len(base_parts) >= 2:
+            major, minor = int(base_parts[0]), int(base_parts[1])
+            matching = []
+            for v in available_versions:
+                try:
+                    v_parts = v.split(".")
+                    if len(v_parts) >= 2:
+                        if int(v_parts[0]) == major and int(v_parts[1]) == minor:
+                            matching.append(v)
+                except ValueError:
+                    continue
+
+            if matching:
+                return sorted(matching, key=lambda x: self.version_key(x))[-1]
+        return None
+
+    def match_range(self, available_versions, range_spec: str) -> Optional[str]:
+        m = re.match(r">=(\d+\.\d+\.\d+)", range_spec)
+        if m:
+            min_ver = m.group(1)
+            matching = [
+                v for v in available_versions if self.compare_versions(v, min_ver) >= 0
+            ]
+            if matching:
+                return sorted(matching, key=lambda x: self.version_key(x))[-1]
+        return None
+
+    def version_key(self, v: str) -> list:
+        parts = []
+        for p in v.split("."):
+            num = re.split(r"[-+]", p)[0]
+            try:
+                parts.append(int(num))
+            except ValueError:
+                parts.append(0)
+        return parts
+
+    def compare_versions(self, v1: str, v2: str) -> int:
+        parts1 = self.version_key(v1)
+        parts2 = self.version_key(v2)
+
+        for i in range(max(len(parts1), len(parts2))):
+            p1 = parts1[i] if i < len(parts1) else 0
+            p2 = parts2[i] if i < len(parts2) else 0
+
+            if p1 > p2:
+                return 1
+            elif p1 < p2:
+                return -1
+        return 0
+
+    def install_package(self, pkg: Package):
+        if pkg.name in self.resolved and pkg.installed:
+            return
+
+        print(f"Installing {pkg.name}@{pkg.version}")
+
+        self.node_modules.mkdir(parents=True, exist_ok=True)
+
+        try:
+            if not pkg.tarball:
+                print(f"No tarball for {pkg.name}")
+                return
+
+            with tempfile.NamedTemporaryFile(suffix=".tgz", delete=False) as tmp:
+                tmp_path = tmp.name
+
+            result = subprocess.run(
+                ["curl", "-s", "-f", "-L", "-o", tmp_path, pkg.tarball],
+                capture_output=True,
+                timeout=DOWNLOAD_TIMEOUT,
+            )
+
+            if result.returncode != 0:
+                print(f"Failed to download {pkg.name}")
+                os.unlink(tmp_path)
+                return
+
+            pkg_dir = self.node_modules / pkg.name
+            pkg_dir.mkdir(parents=True, exist_ok=True)
+
+            subprocess.run(
+                ["tar", "-xzf", tmp_path, "-C", str(pkg_dir), "--strip-components=1"],
+                check=True,
+            )
+
+            os.unlink(tmp_path)
+
+            self.write_package_json(pkg)
+            self.create_bin_links(pkg)
+
+            pkg.installed = True
+            self.resolved.add(pkg.name)
+
+        except Exception as e:
+            print(f"Failed to install {pkg.name}: {e}")
+
+    def create_bin_links(self, pkg: Package):
+        pkg_dir = self.node_modules / pkg.name
+        pkg_json_path = pkg_dir / "package.json"
+
+        if not pkg_json_path.exists():
+            return
+
+        try:
+            with open(pkg_json_path) as f:
+                pkg_data = json.load(f)
+
+            bin_entry = pkg_data.get("bin")
+            if not bin_entry:
+                return
+
+            bin_dir = self.node_modules / ".bin"
+            bin_dir.mkdir(parents=True, exist_ok=True)
+
+            if isinstance(bin_entry, dict):
+                for name, path in bin_entry.items():
+                    self.create_symlink(bin_dir, name, pkg_dir / path)
+            else:
+                name = pkg.name.split("/")[-1]
+                self.create_symlink(bin_dir, name, pkg_dir / bin_entry)
+
+        except Exception as e:
+            pass
+
+    def create_symlink(self, bin_dir: Path, name: str, target: Path):
+        link_path = bin_dir / name
+        try:
+            if link_path.exists():
+                link_path.unlink()
+            link_path.symlink_to(target)
+        except Exception:
+            pass
+
+    def write_package_json(self, pkg: Package):
+        pkg_json = {
+            "name": pkg.name,
+            "version": pkg.version,
+            "dependencies": pkg.dependencies,
+        }
+
+        pkg_dir = self.node_modules / pkg.name
+        with open(pkg_dir / "package.json", "w") as f:
+            json.dump(pkg_json, f, indent=2)
+
+    def run_postinstall(self):
+        print("Running postinstall scripts...")
+
+        for pkg_dir in self.node_modules.iterdir():
+            if not pkg_dir.is_dir():
+                continue
+
+            pkg_json_path = pkg_dir / "package.json"
+            if not pkg_json_path.exists():
+                continue
+
+            try:
+                with open(pkg_json_path) as f:
+                    pkg_data = json.load(f)
+
+                scripts = pkg_data.get("scripts", {})
+                postinstall = scripts.get("postinstall")
+
+                if postinstall:
+                    print(f"Running postinstall for {pkg_data['name']}")
+                    env = os.environ.copy()
+                    env["PATH"] = (
+                        f"/usr/local/bin:/usr/bin:/bin:{self.node_modules}/.bin"
+                    )
+
+                    subprocess.run(
+                        ["bash", "-c", postinstall],
+                        cwd=str(pkg_dir),
+                        env=env,
+                        capture_output=True,
+                    )
+            except Exception as e:
+                print(f"Postinstall error for {pkg_dir.name}: {e}")
+
+
+def main():
+    if len(sys.argv) > 1:
+        pkg_json = sys.argv[1]
+    else:
+        pkg_json = "package.json"
+
+    installer = Installer(pkg_json)
+    installer.run()
+
+
+if __name__ == "__main__":
+    main()
