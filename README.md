@@ -9,6 +9,7 @@ then run `./run.sh <number of megs>`
 
 Minimal requirements:
 
+0. **she/it (ours) - 192m RAM**
 1. bun - 298m RAM
 2. yarn - 325m RAM
 3. pnpm - 449m RAM
