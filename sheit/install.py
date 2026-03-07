@@ -432,11 +432,10 @@ class Installer:
 
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument("package_json", nargs="?", default="package.json")
     parser.add_argument("-c", "--concurrent", type=int, default=DEFAULT_MAX_CONCURRENT)
     args = parser.parse_args()
 
-    installer = Installer(args.package_json, args.concurrent)
+    installer = Installer("package.json", args.concurrent)
     installer.run()
 
 
