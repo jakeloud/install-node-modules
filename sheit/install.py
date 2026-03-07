@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+import argparse
 import json
 import os
 import re
@@ -11,7 +12,7 @@ from pathlib import Path
 from typing import Optional
 
 NPM_REGISTRY = "https://registry.npmjs.org"
-MAX_CONCURRENT = 64
+DEFAULT_MAX_CONCURRENT = 4
 NODE_MODULES = Path("node_modules")
 FETCH_TIMEOUT = 300
 DOWNLOAD_TIMEOUT = 600
@@ -27,8 +28,9 @@ class Package:
 
 
 class Installer:
-    def __init__(self, package_json_path: str):
+    def __init__(self, package_json_path: str, max_concurrent: int):
         self.package_json_path = Path(package_json_path)
+        self.max_concurrent = max_concurrent
         self.packages: dict[str, Package] = {}
         self.resolved: set[str] = set()
         self.resolving: set[str] = set()
@@ -71,7 +73,7 @@ class Installer:
             batch = []
             processed = 0
 
-            while queue and processed < MAX_CONCURRENT:
+            while queue and processed < self.max_concurrent:
                 name, version_spec = queue.popleft()
                 if name not in self.resolved:
                     batch.append((name, version_spec))
@@ -80,7 +82,7 @@ class Installer:
             if not batch:
                 break
 
-            with ThreadPoolExecutor(max_workers=MAX_CONCURRENT) as executor:
+            with ThreadPoolExecutor(max_workers=self.max_concurrent) as executor:
                 futures = {
                     executor.submit(self.resolve_package, name, version_spec): (
                         name,
@@ -429,12 +431,12 @@ class Installer:
 
 
 def main():
-    if len(sys.argv) > 1:
-        pkg_json = sys.argv[1]
-    else:
-        pkg_json = "package.json"
+    parser = argparse.ArgumentParser()
+    parser.add_argument("package_json", nargs="?", default="package.json")
+    parser.add_argument("-c", "--concurrent", type=int, default=DEFAULT_MAX_CONCURRENT)
+    args = parser.parse_args()
 
-    installer = Installer(pkg_json)
+    installer = Installer(args.package_json, args.concurrent)
     installer.run()
 
 
