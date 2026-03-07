@@ -13,8 +13,8 @@ from typing import Optional
 NPM_REGISTRY = "https://registry.npmjs.org"
 MAX_CONCURRENT = 64
 NODE_MODULES = Path("node_modules")
-FETCH_TIMEOUT = 120
-DOWNLOAD_TIMEOUT = 300
+FETCH_TIMEOUT = 300
+DOWNLOAD_TIMEOUT = 600
 
 
 class Package:
@@ -53,8 +53,9 @@ class Installer:
                 data = json.load(f)
             deps = data.get("dependencies", {})
             dev_deps = data.get("devDependencies", {})
-            # Merge dependencies and devDependencies
-            all_deps = {**dev_deps, **deps}
+            opt_deps = data.get("optionalDependencies", {})
+            # Merge all dependency types
+            all_deps = {**opt_deps, **dev_deps, **deps}
             return all_deps
         except (FileNotFoundError, json.JSONDecodeError) as e:
             print(f"Error reading package.json: {e}")
@@ -118,19 +119,26 @@ class Installer:
             url = f"{NPM_REGISTRY}/{name}"
             result = None
             for i in range(retries):
-                result = subprocess.run(
-                    ["curl", "-s", "-f", "-L", url],
-                    capture_output=True,
-                    text=True,
-                    timeout=FETCH_TIMEOUT,
-                )
+                try:
+                    result = subprocess.run(
+                        ["curl", "-s", "-f", "-L", url],
+                        capture_output=True,
+                        text=True,
+                        timeout=FETCH_TIMEOUT,
+                    )
+                    if result.returncode == 0:
+                        break
+                except subprocess.TimeoutExpired:
+                    print(f"Timeout fetching {name} ({i + 1}/{retries})...")
+                except Exception as e:
+                    print(f"Error fetching {name} ({i + 1}/{retries}): {e}")
 
-                if result.returncode == 0:
-                    break
                 if i == retries - 1:
                     print(f"Failed to fetch {name} after {retries} attempts")
                     return None
-                print(f"Retrying {name} ({i + 1}/{retries})...")
+                import time
+
+                time.sleep(1)
 
             if result is None or result.returncode != 0:
                 return None
@@ -152,10 +160,12 @@ class Installer:
                 print(f"No tarball for {name}@{version}")
                 return None
 
-            deps = metadata.get("versions", {}).get(version, {}).get("dependencies", {})
+            v_data = metadata.get("versions", {}).get(version, {})
+            deps = v_data.get("dependencies", {})
+            opt_deps = v_data.get("optionalDependencies", {})
 
             pkg = Package(name, version, tarball)
-            pkg.dependencies = deps
+            pkg.dependencies = {**opt_deps, **deps}
             return pkg
 
         except Exception as e:
@@ -275,7 +285,7 @@ class Installer:
                 return -1
         return 0
 
-    def install_package(self, pkg: Package):
+    def install_package(self, pkg: Package, retries=3):
         if pkg.name in self.resolved and pkg.installed:
             return
 
@@ -291,14 +301,29 @@ class Installer:
             with tempfile.NamedTemporaryFile(suffix=".tgz", delete=False) as tmp:
                 tmp_path = tmp.name
 
-            result = subprocess.run(
-                ["curl", "-s", "-f", "-L", "-o", tmp_path, pkg.tarball],
-                capture_output=True,
-                timeout=DOWNLOAD_TIMEOUT,
-            )
+            success = False
+            for i in range(retries):
+                try:
+                    result = subprocess.run(
+                        ["curl", "-s", "-f", "-L", "-o", tmp_path, pkg.tarball],
+                        capture_output=True,
+                        timeout=DOWNLOAD_TIMEOUT,
+                    )
+                    if result.returncode == 0:
+                        success = True
+                        break
+                except subprocess.TimeoutExpired:
+                    print(f"Timeout downloading {pkg.name} ({i + 1}/{retries})...")
+                except Exception as e:
+                    print(f"Error downloading {pkg.name} ({i + 1}/{retries}): {e}")
 
-            if result.returncode != 0:
-                print(f"Failed to download {pkg.name}")
+                if i < retries - 1:
+                    import time
+
+                    time.sleep(1)
+
+            if not success:
+                print(f"Failed to download {pkg.name} after {retries} attempts")
                 if os.path.exists(tmp_path):
                     os.unlink(tmp_path)
                 return
