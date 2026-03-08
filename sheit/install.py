@@ -7,6 +7,7 @@ import subprocess
 import sys
 import tempfile
 import hashlib
+import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 from typing import Optional
@@ -435,8 +436,11 @@ def main():
     parser.add_argument("-c", "--concurrent", type=int, default=DEFAULT_MAX_CONCURRENT)
     args = parser.parse_args()
 
+    start_time = time.perf_counter()
     installer = Installer("package.json", args.concurrent)
     installer.run()
+    end_time = time.perf_counter()
+    print(f"Done in: {(end_time - start_time):.4f} seconds")
 
 
 if __name__ == "__main__":
