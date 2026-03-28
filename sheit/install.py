@@ -8,9 +8,11 @@ import sys
 import tempfile
 import hashlib
 import time
+from collections import deque
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 from typing import Optional
+
 
 NPM_REGISTRY = "https://registry.npmjs.org"
 DEFAULT_MAX_CONCURRENT = 4
@@ -65,8 +67,6 @@ class Installer:
             return {}
 
     def resolve_and_install(self, deps: dict):
-        from collections import deque
-
         queue = deque(deps.items())
         enqueued = set(deps.keys())
 
@@ -139,8 +139,6 @@ class Installer:
                 if i == retries - 1:
                     print(f"Failed to fetch {name} after {retries} attempts")
                     return None
-                import time
-
                 time.sleep(1)
 
             if result is None or result.returncode != 0:
