@@ -1,12 +1,16 @@
 package main
 
 import (
+	"archive/tar"
+	"compress/gzip"
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"maps"
 	"net/http"
 	"os"
+	"path/filepath"
 	"regexp"
 	"slices"
 	"strconv"
@@ -21,6 +25,17 @@ type Package struct {
 	Dependencies         map[string]string `json:"dependencies"`
 	OptionalDependencies map[string]string `json:"optionalDependencies"`
 	DevDependencies      map[string]string `json:"devDependencies"`
+}
+
+type PostPackage struct {
+	Postinstall string
+}
+
+type PostPackageRaw struct {
+	Bin     any `json:"bin"`
+	Scripts struct {
+		Postinstall string `json:"postinstall"`
+	} `json:"scripts"`
 }
 
 type Version struct {
@@ -48,9 +63,15 @@ func getMetadata(name string) (m Metadata, err error) {
 	return m, nil
 }
 
+var (
+	prereleaseRegex = regexp.MustCompile("[a-zA-Z]")
+	plusMinusRegex  = regexp.MustCompile("[-+]")
+)
+
 func versionCmp(a, b string) int {
 	return slices.Compare(versionKey(a), versionKey(b))
 }
+
 func versionKey(version string) []int {
 	parts := make([]int, 3)
 	for _, p := range strings.Split(version, ".") {
@@ -62,9 +83,6 @@ func versionKey(version string) []int {
 	}
 	return parts
 }
-
-var prereleaseRegex = regexp.MustCompile("[a-zA-Z]")
-var plusMinusRegex = regexp.MustCompile("[-+]")
 
 func getLatest(versions []string) string {
 	valid := make([]string, 0)
@@ -144,7 +162,7 @@ func resolvePackage(name string, semver string) (p Package, err error) {
 	}
 	version := ""
 	allVersions := slices.Collect(maps.Keys(m.Versions))
-	if semver == "*" || semver == "latest" {
+	if semver == "*" || semver == "latest" || semver == "" {
 		version = getLatest(allVersions)
 	} else if strings.HasPrefix(semver, "^") {
 		version = matchCaret(semver[1:], allVersions)
@@ -165,7 +183,8 @@ func resolvePackage(name string, semver string) (p Package, err error) {
 	return p, errors.New("No matching version found for " + semver)
 }
 
-func install(initialDeps map[string]string) error {
+func install(initialDeps map[string]string) (pps map[string]PostPackage, err error) {
+	pps = make(map[string]PostPackage)
 	count := 0
 	deps := make(map[string]string)
 	installed := make(map[string]struct{})
@@ -178,30 +197,125 @@ func install(initialDeps map[string]string) error {
 			fmt.Printf("Installing %s@%s\n", name, semver)
 			p, err := resolvePackage(name, semver)
 			if err != nil {
-				return err
+				return pps, err
 			}
-			err = p.Install()
+			pp, err := p.Install()
 			if err != nil {
-				return err
+				return pps, err
 			}
+			pps[name] = pp
 			installed[name] = struct{}{}
 			maps.Copy(deps, p.Dependencies)
 			count += 1
 		}
 	}
 	fmt.Printf("Installed %d packages\n", count)
-	// 539
-	return nil
+	return pps, nil
 }
 
-func (p Package) Install() error {
+func (p Package) Install() (pp PostPackage, err error) {
 	if p.Tarball == "" {
-		return errors.New("No tarball found for " + p.Name)
+		return pp, errors.New("No tarball found for " + p.Name)
+	}
+	resp, err := http.Get(p.Tarball)
+	if err != nil {
+		return pp, err
+	}
+	defer resp.Body.Close()
+
+	gzr, err := gzip.NewReader(resp.Body)
+	if err != nil {
+		return pp, err
+	}
+	defer gzr.Close()
+
+	tr := tar.NewReader(gzr)
+
+	for {
+		header, err := tr.Next()
+		if err == io.EOF {
+			break
+		}
+		if err != nil {
+			return pp, err
+		}
+		fp := strings.Join(strings.Split(header.Name, "/")[1:], "/")
+		target := filepath.Join("node_modules", p.Name, filepath.Clean(fp))
+		switch header.Typeflag {
+		case tar.TypeDir:
+			os.MkdirAll(target, 0755)
+		case tar.TypeReg:
+			os.MkdirAll(filepath.Dir(target), 0755)
+			f, err := os.OpenFile(target, os.O_CREATE|os.O_RDWR, os.FileMode(header.Mode))
+			if err != nil {
+				return pp, err
+			}
+			io.Copy(f, tr)
+			f.Close()
+			if fp == "package.json" {
+				f, err := os.Open(target)
+				if err != nil {
+					return pp, err
+				}
+				var ppr PostPackageRaw
+				err = json.NewDecoder(f).Decode(&ppr)
+				if err != nil {
+					return pp, err
+				}
+				f.Close()
+				err = p.createBinLinks(ppr.Bin)
+				if err != nil {
+					return pp, err
+				}
+				pp.Postinstall = ppr.Scripts.Postinstall
+			}
+		}
+	}
+	return pp, nil
+}
+
+func (p Package) createBinLinks(bin any) error {
+	pkgDir := filepath.Join("node_modules", p.Name)
+	binDir := filepath.Join("node_modules", ".bin")
+
+	switch b := bin.(type) {
+	case string:
+		nameParts := strings.Split(p.Name, "/")
+		name := nameParts[len(nameParts)-1]
+		createSymlink(binDir, name, filepath.Join(pkgDir, b))
+	case map[string]interface{}:
+		for name, path := range b {
+			spath, ok := path.(string)
+			if ok {
+				createSymlink(binDir, name, filepath.Join(pkgDir, spath))
+			}
+		}
+	default:
 	}
 	return nil
 }
 
-func postinstall() error {
+func createSymlink(binDir string, name string, target string) {
+	linkPath := filepath.Join(binDir, name)
+	os.Remove(linkPath)
+	absTarget, err := filepath.Abs(target)
+	if err != nil {
+		fmt.Println("Failed to create symlink %s: %v", name, err)
+		return
+	}
+	info, err := os.Stat(absTarget)
+
+	if err == nil && !info.IsDir() {
+		os.Chmod(absTarget, 0755)
+		if err := os.Symlink(absTarget, linkPath); err == nil {
+			fmt.Printf("Linked %s -> %s\n", name, absTarget)
+		} else {
+			fmt.Printf("Failed to create symlink %s: %v\n", name, err)
+		}
+	}
+}
+
+func postinstall(postPackages map[string]PostPackage) error {
 	return nil
 }
 
@@ -230,17 +344,17 @@ func main() {
 		fmt.Printf("Error inital: %v\n", err)
 		return
 	}
-	err = os.MkdirAll("node_modules", 0755)
+	err = os.MkdirAll("node_modules/.bin", 0755)
 	if err != nil {
 		fmt.Printf("Error mkdir: %v\n", err)
 		return
 	}
-	err = install(initialDeps)
+	postPackages, err := install(initialDeps)
 	if err != nil {
 		fmt.Printf("Error install: %v\n", err)
 		return
 	}
-	err = postinstall()
+	err = postinstall(postPackages)
 	if err != nil {
 		fmt.Printf("Error postinstall: %v\n", err)
 		return

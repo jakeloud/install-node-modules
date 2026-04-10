@@ -27,7 +27,7 @@ PS: i tested this on 8G VPS, so this is clean environment without any interferen
 [ied](https://github.com/alexanderGugel/ied) does not work with modern packages?
 
 [caladan](https://github.com/healeycodes/caladan) would not compile
+(actually has a good write-up https://healeycodes.com/installing-npm-packages-very-quickly)
 
 [boltpm](https://github.com/nom-nom-hub/boltpm) fetches localhost???
-
 
