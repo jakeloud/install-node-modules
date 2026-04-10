@@ -6,4 +6,4 @@ RUN apt-get update && \
 
 COPY package.json .
 COPY sheit/install.py .
-CMD ["python", "install.py", "-c", "1"]
+CMD ["python3", "install.py", "-c", "1"]
