@@ -16,7 +16,7 @@ Minimal requirements:
 4. npm - 482m RAM
 5. flashinstall - 504m RAM
 
-PS: i tested this on 8G VPS, so this is clean environment without any interference with the results.
+PS: i tested this on 4vcpu 8G VPS, so this is clean environment without any interference with the results.
 
 ## Other installers
 

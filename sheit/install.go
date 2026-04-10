@@ -10,6 +10,7 @@ import (
 	"maps"
 	"net/http"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"regexp"
 	"slices"
@@ -28,6 +29,7 @@ type Package struct {
 }
 
 type PostPackage struct {
+	Name        string
 	Postinstall string
 }
 
@@ -268,6 +270,7 @@ func (p Package) Install() (pp PostPackage, err error) {
 					return pp, err
 				}
 				pp.Postinstall = ppr.Scripts.Postinstall
+				pp.Name = p.Name
 			}
 		}
 	}
@@ -316,6 +319,26 @@ func createSymlink(binDir string, name string, target string) {
 }
 
 func postinstall(postPackages map[string]PostPackage) error {
+	env := os.Environ()
+	nodeBin := filepath.Join("node_modules", ".bin")
+	newPath := fmt.Sprintf("PATH=/usr/local/bin:/usr/bin:/bin:%s", nodeBin)
+	env = append(env, newPath)
+
+	for name, pp := range postPackages {
+		if pp.Postinstall == "" {
+			continue
+		}
+		fmt.Printf("Running postinstall for %s\n", name)
+		pkgDir := filepath.Join("node_modules", pp.Name)
+		cmd := exec.Command("bash", "-c", pp.Postinstall)
+		cmd.Dir = pkgDir
+		cmd.Env = env
+
+		output, err := cmd.CombinedOutput()
+		if err != nil {
+			return fmt.Errorf("Postinstall failed: %w; output: %s\n", err, string(output))
+		}
+	}
 	return nil
 }
 
