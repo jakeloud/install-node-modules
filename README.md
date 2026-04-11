@@ -9,12 +9,13 @@ then run `./run.sh <number of megs>`
 
 Minimal requirements:
 
-0. **she/it (ours) - 192m RAM**
-1. bun - 298m RAM
-2. yarn - 325m RAM
-3. pnpm - 449m RAM
-4. npm - 482m RAM
-5. flashinstall - 504m RAM
+0. **she/it GO (ours) - 168m RAM**
+1. **she/it (ours) - 192m RAM**
+2. bun - 298m RAM
+3. yarn - 325m RAM
+4. pnpm - 449m RAM
+5. npm - 482m RAM
+6. flashinstall - 504m RAM
 
 PS: i tested this on 4vcpu 8G VPS, so this is clean environment without any interference with the results.
 

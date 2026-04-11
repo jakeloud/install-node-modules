@@ -320,9 +320,19 @@ func createSymlink(binDir string, name string, target string) {
 
 func postinstall(postPackages map[string]PostPackage) error {
 	env := os.Environ()
-	nodeBin := filepath.Join("node_modules", ".bin")
-	newPath := fmt.Sprintf("PATH=/usr/local/bin:/usr/bin:/bin:%s", nodeBin)
-	env = append(env, newPath)
+	nodeBin, err := filepath.Abs(filepath.Join("node_modules", ".bin"))
+	if err != nil {
+		return err
+	}
+	if _, err := exec.LookPath("node"); err != nil {
+		if bunPath, err := exec.LookPath("bun"); err == nil {
+			os.Remove(filepath.Join(nodeBin, "node"))
+			if err := os.Symlink(bunPath, filepath.Join(nodeBin, "node")); err != nil {
+				return err
+			}
+		}
+	}
+	env = append(env, fmt.Sprintf("PATH=/usr/local/bin:/usr/bin:/bin:%s", nodeBin))
 
 	for name, pp := range postPackages {
 		if pp.Postinstall == "" {
